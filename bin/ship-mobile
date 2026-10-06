@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# Ship any Expo app's store listing and binary.
+#
+# Run from the app's directory (the one that contains eas.json).
+# Default spends no EAS build credit: push store.config.json, then submit
+# the latest finished production build already on EAS.
+#
+#   ship-mobile                         iOS metadata + submit latest build
+#   ship-mobile --platform android
+#   ship-mobile --platform all
+#   ship-mobile --metadata-only
+#   ship-mobile --local                 compile on this machine, then submit
+#   ship-mobile --cloud                 one EAS cloud build per platform, then submit
+#   ship-mobile --dry-run
+
+set -euo pipefail
+
+MODE="submit-latest"
+MODE_SET=0
+DRY_RUN=0
+PLATFORM="ios"
+
+usage() {
+  cat <<'EOF'
+Usage: ship-mobile [--platform ios|android|all] [--metadata-only | --local | --cloud] [--dry-run]
+
+Run this inside any Expo project that has eas.json and store.config.json.
+
+  (default)        Push the store listing, then submit the latest production
+                   build already on EAS. Does not compile. Does not spend an
+                   EAS build credit.
+  --metadata-only  Push the store listing and stop.
+  --local          Push the listing, compile on this machine, then submit.
+                   iOS needs Xcode. Android needs the Android SDK.
+                   Does not spend an EAS build credit.
+  --cloud          Push the listing, start an EAS cloud build, and submit it
+                   when the build finishes. Spends one build credit per platform.
+  --platform       ios (default), android, or all.
+  --dry-run        Print the commands without running them.
+
+The upload does not press Submit for Review. After the store finishes
+processing, select the build on the version and send it to review.
+EOF
+}
+
+choose_mode() {
+  if [[ "$MODE_SET" -eq 1 ]]; then
+    echo "Choose only one of --metadata-only, --local, or --cloud." >&2
+    exit 1
+  fi
+  MODE="$1"
+  MODE_SET=1
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --metadata-only) choose_mode "metadata-only" ;;
+    --local) choose_mode "local" ;;
+    --cloud) choose_mode "cloud" ;;
+    --dry-run) DRY_RUN=1 ;;
+    --platform)
+      shift
+      PLATFORM="${1:-}"
+      ;;
+    --platform=*)
+      PLATFORM="${1#--platform=}"
+      ;;
+    -h|--help) usage; exit 0 ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+case "$PLATFORM" in
+  ios|android|all) ;;
+  *)
+    echo "Platform must be ios, android, or all." >&2
+    exit 1
+    ;;
+esac
+
+find_root() {
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -f "$dir/eas.json" ]]; then
+      echo "$dir"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+
+ROOT="$(find_root || true)"
+if [[ -z "$ROOT" ]]; then
+  echo "No eas.json found from $PWD. Run ship-mobile inside an Expo project." >&2
+  exit 1
+fi
+cd "$ROOT"
+
+if [[ ! -f "$ROOT/store.config.json" ]]; then
+  echo "No store.config.json in $ROOT." >&2
+  echo "Create one with: npx eas-cli metadata:pull" >&2
+  exit 1
+fi
+
+has_profile() {
+  local section="$1"
+  node -e '
+    const fs = require("fs");
+    const eas = JSON.parse(fs.readFileSync("eas.json", "utf8"));
+    const section = process.argv[1];
+    process.exit(eas[section] && eas[section].production ? 0 : 1);
+  ' "$section"
+}
+
+PROFILE_ARGS=()
+if has_profile submit || has_profile build; then
+  PROFILE_ARGS=(--profile production)
+fi
+
+run() {
+  echo "+ $*"
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    "$@"
+  fi
+}
+
+platforms() {
+  if [[ "$PLATFORM" == "all" ]]; then
+    echo ios
+    echo android
+  else
+    echo "$PLATFORM"
+  fi
+}
+
+echo "Ship $PLATFORM ($MODE) in $ROOT"
+if [[ "$MODE" == "cloud" ]]; then
+  echo "This run starts an EAS cloud build and spends one build credit per platform."
+fi
+
+run npx eas-cli metadata:lint "${PROFILE_ARGS[@]}"
+run npx eas-cli metadata:push "${PROFILE_ARGS[@]}" --non-interactive
+
+if [[ "$MODE" == "metadata-only" ]]; then
+  echo "Listing pushed. No binary was uploaded."
+  exit 0
+fi
+
+mkdir -p "$ROOT/dist"
+
+while IFS= read -r plat; do
+  if [[ "$MODE" == "submit-latest" ]]; then
+    echo "Submitting the latest production $plat build already on EAS."
+    run npx eas-cli submit --platform "$plat" "${PROFILE_ARGS[@]}" --latest --non-interactive --wait
+  elif [[ "$MODE" == "local" ]]; then
+    if [[ "$plat" == "ios" ]]; then
+      ARTIFACT="$ROOT/dist/ship.ipa"
+    else
+      ARTIFACT="$ROOT/dist/ship.aab"
+    fi
+    echo "Compiling $plat on this machine. EAS build credits are not used."
+    run npx eas-cli build --platform "$plat" "${PROFILE_ARGS[@]}" --local --output "$ARTIFACT"
+    run npx eas-cli submit --platform "$plat" "${PROFILE_ARGS[@]}" --path "$ARTIFACT" --non-interactive --wait
+  elif [[ "$MODE" == "cloud" ]]; then
+    run npx eas-cli build --platform "$plat" "${PROFILE_ARGS[@]}" --non-interactive --wait --auto-submit
+  fi
+done < <(platforms)
+
+cat <<EOF
+
+Upload finished for $PLATFORM.
+The store still has to process the build. Then select it on the version and send it to review.
+EOF
